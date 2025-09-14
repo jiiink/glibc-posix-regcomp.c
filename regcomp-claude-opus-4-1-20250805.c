@@ -215,26 +215,28 @@ static const size_t __re_error_msgid_idx[] =
 
 const char *
 re_compile_pattern (const char *pattern, size_t length,
-		    struct re_pattern_buffer *bufp)
+                    struct re_pattern_buffer *bufp)
 {
   reg_errcode_t ret;
 
-  if (!pattern || !bufp) {
-    return gettext("Invalid argument");
+  if (bufp == NULL) {
+    return gettext (__re_error_msgid + __re_error_msgid_idx[(int) REG_BADPAT]);
   }
 
-  bufp->no_sub = !!(re_syntax_options & RE_NO_SUB);
+  bufp->no_sub = (re_syntax_options & RE_NO_SUB) != 0;
   bufp->newline_anchor = 1;
 
   ret = re_compile_internal (bufp, pattern, length, re_syntax_options);
 
-  if (ret == REG_NOERROR)
+  if (ret == REG_NOERROR) {
     return NULL;
-  
-  if (ret >= 0 && ret < (sizeof(__re_error_msgid_idx) / sizeof(__re_error_msgid_idx[0])))
-    return gettext (__re_error_msgid + __re_error_msgid_idx[(int) ret]);
-  
-  return gettext("Unknown error");
+  }
+
+  if (ret < 0 || ret >= REG_ERROR_NUM) {
+    return gettext (__re_error_msgid + __re_error_msgid_idx[(int) REG_BADPAT]);
+  }
+
+  return gettext (__re_error_msgid + __re_error_msgid_idx[(int) ret]);
 }
 weak_alias (__re_compile_pattern, re_compile_pattern)
 
@@ -254,40 +256,40 @@ reg_syntax_t re_syntax_options;
    defined in regex.h.  We return the old syntax.  */
 
 reg_syntax_t
-re_set_syntax(reg_syntax_t syntax)
+re_set_syntax (reg_syntax_t syntax)
 {
-    reg_syntax_t ret = re_syntax_options;
-    re_syntax_options = syntax;
-    return ret;
+  reg_syntax_t previous_syntax = re_syntax_options;
+  re_syntax_options = syntax;
+  return previous_syntax;
 }
 weak_alias (__re_set_syntax, re_set_syntax)
 
 int
 re_compile_fastmap (struct re_pattern_buffer *bufp)
 {
-  if (!bufp || !bufp->buffer || !bufp->fastmap)
-    return -1;
-
   re_dfa_t *dfa = bufp->buffer;
   char *fastmap = bufp->fastmap;
+  
+  if (dfa == NULL || fastmap == NULL) {
+    return -1;
+  }
 
   memset (fastmap, '\0', sizeof (char) * SBC_MAX);
   
-  if (re_compile_fastmap_iter (bufp, dfa->init_state, fastmap) != 0)
-    return -1;
+  re_compile_fastmap_iter (bufp, dfa->init_state, fastmap);
   
-  if (dfa->init_state != dfa->init_state_word)
-    if (re_compile_fastmap_iter (bufp, dfa->init_state_word, fastmap) != 0)
-      return -1;
+  re_state_t *states[] = {
+    dfa->init_state_word,
+    dfa->init_state_nl,
+    dfa->init_state_begbuf
+  };
   
-  if (dfa->init_state != dfa->init_state_nl)
-    if (re_compile_fastmap_iter (bufp, dfa->init_state_nl, fastmap) != 0)
-      return -1;
+  for (int i = 0; i < 3; i++) {
+    if (states[i] != dfa->init_state) {
+      re_compile_fastmap_iter (bufp, states[i], fastmap);
+    }
+  }
   
-  if (dfa->init_state != dfa->init_state_begbuf)
-    if (re_compile_fastmap_iter (bufp, dfa->init_state_begbuf, fastmap) != 0)
-      return -1;
-
   bufp->fastmap_accurate = 1;
   return 0;
 }
@@ -297,9 +299,9 @@ static inline void
 __attribute__ ((always_inline))
 re_set_fastmap (char *fastmap, bool icase, int ch)
 {
-  if (ch < 0 || ch > 255) 
+  if (fastmap == NULL || ch < 0 || ch > 255)
     return;
-  
+    
   fastmap[ch] = 1;
   if (icase && ch != tolower(ch))
     fastmap[tolower(ch)] = 1;
@@ -313,10 +315,9 @@ re_compile_fastmap_iter (regex_t *bufp, const re_dfastate_t *init_state,
 			 char *fastmap)
 {
   re_dfa_t *dfa = bufp->buffer;
-  Idx node_cnt;
   bool icase = (dfa->mb_cur_max == 1 && (bufp->syntax & RE_ICASE));
   
-  for (node_cnt = 0; node_cnt < init_state->nodes.nelem; ++node_cnt)
+  for (Idx node_cnt = 0; node_cnt < init_state->nodes.nelem; ++node_cnt)
     {
       Idx node = init_state->nodes.elems[node_cnt];
       re_token_type_t type = dfa->nodes[node].type;
@@ -325,17 +326,89 @@ re_compile_fastmap_iter (regex_t *bufp, const re_dfastate_t *init_state,
 	{
 	  re_set_fastmap (fastmap, icase, dfa->nodes[node].opr.c);
 #ifdef RE_ENABLE_I18N
-	  handle_character_icase(bufp, dfa, fastmap, node);
+	  if ((bufp->syntax & RE_ICASE) && dfa->mb_cur_max > 1)
+	    {
+	      unsigned char buf[MB_LEN_MAX];
+	      unsigned char *p = buf;
+	      wchar_t wc;
+	      mbstate_t state;
+
+	      *p++ = dfa->nodes[node].opr.c;
+	      while (++node < dfa->nodes_len
+		     &&	dfa->nodes[node].type == CHARACTER
+		     && dfa->nodes[node].mb_partial)
+		*p++ = dfa->nodes[node].opr.c;
+	      memset (&state, '\0', sizeof (state));
+	      if (__mbrtowc (&wc, (const char *) buf, p - buf,
+			     &state) == p - buf
+		  && (__wcrtomb ((char *) buf, __towlower (wc), &state)
+		      != (size_t) -1))
+		re_set_fastmap (fastmap, false, buf[0]);
+	    }
 #endif
 	}
       else if (type == SIMPLE_BRACKET)
 	{
-	  handle_simple_bracket(fastmap, dfa, node, icase);
+	  int ch = 0;
+	  for (int i = 0; i < BITSET_WORDS; ++i)
+	    {
+	      bitset_word_t w = dfa->nodes[node].opr.sbcset[i];
+	      for (int j = 0; j < BITSET_WORD_BITS; ++j, ++ch)
+		if (w & ((bitset_word_t) 1 << j))
+		  re_set_fastmap (fastmap, icase, ch);
+	    }
 	}
 #ifdef RE_ENABLE_I18N
       else if (type == COMPLEX_BRACKET)
 	{
-	  handle_complex_bracket(bufp, dfa, fastmap, node, icase);
+	  re_charset_t *cset = dfa->nodes[node].opr.mbcset;
+
+# ifdef _LIBC
+	  if (_NL_CURRENT_WORD (LC_COLLATE, _NL_COLLATE_NRULES) != 0
+	      && (cset->ncoll_syms || cset->nranges))
+	    {
+	      const int32_t *table = (const int32_t *)
+		_NL_CURRENT (LC_COLLATE, _NL_COLLATE_TABLEMB);
+	      for (Idx i = 0; i < SBC_MAX; ++i)
+		if (table[i] < 0)
+		  re_set_fastmap (fastmap, icase, i);
+	    }
+# endif
+
+	  if (dfa->mb_cur_max > 1
+	      && (cset->nchar_classes || cset->non_match || cset->nranges
+# ifdef _LIBC
+		  || cset->nequiv_classes
+# endif
+		 ))
+	    {
+	      unsigned char c = 0;
+	      do
+		{
+		  mbstate_t mbs;
+		  memset (&mbs, 0, sizeof (mbs));
+		  if (__mbrtowc (NULL, (char *) &c, 1, &mbs) == (size_t) -2)
+		    re_set_fastmap (fastmap, false, (int) c);
+		}
+	      while (++c != 0);
+	    }
+	  else
+	    {
+	      for (Idx i = 0; i < cset->nmbchars; ++i)
+		{
+		  char buf[256];
+		  mbstate_t state;
+		  memset (&state, '\0', sizeof (state));
+		  if (__wcrtomb (buf, cset->mbchars[i], &state) != (size_t) -1)
+		    re_set_fastmap (fastmap, icase, *(unsigned char *) buf);
+		  if ((bufp->syntax & RE_ICASE) && dfa->mb_cur_max > 1)
+		    {
+		      if (__wcrtomb (buf, __towlower (cset->mbchars[i]), &state)
+			  != (size_t) -1)
+			re_set_fastmap (fastmap, false, *(unsigned char *) buf);
+		    }
+		}
+	    }
 	}
 #endif
       else if (type == OP_PERIOD
@@ -351,130 +424,6 @@ re_compile_fastmap_iter (regex_t *bufp, const re_dfastate_t *init_state,
 	}
     }
 }
-
-#ifdef RE_ENABLE_I18N
-static void
-handle_character_icase(regex_t *bufp, re_dfa_t *dfa, char *fastmap, Idx node)
-{
-  if ((bufp->syntax & RE_ICASE) && dfa->mb_cur_max > 1)
-    {
-      unsigned char buf[MB_LEN_MAX];
-      unsigned char *p;
-      wchar_t wc;
-      mbstate_t state;
-
-      p = buf;
-      *p++ = dfa->nodes[node].opr.c;
-      while (++node < dfa->nodes_len
-	     && dfa->nodes[node].type == CHARACTER
-	     && dfa->nodes[node].mb_partial)
-	*p++ = dfa->nodes[node].opr.c;
-      
-      memset (&state, 0, sizeof (state));
-      if (__mbrtowc (&wc, (const char *) buf, p - buf, &state) == p - buf
-	  && (__wcrtomb ((char *) buf, __towlower (wc), &state) != (size_t) -1))
-	re_set_fastmap (fastmap, false, buf[0]);
-    }
-}
-#endif
-
-static void
-handle_simple_bracket(char *fastmap, re_dfa_t *dfa, Idx node, bool icase)
-{
-  int i, ch;
-  for (i = 0, ch = 0; i < BITSET_WORDS; ++i)
-    {
-      int j;
-      bitset_word_t w = dfa->nodes[node].opr.sbcset[i];
-      for (j = 0; j < BITSET_WORD_BITS; ++j, ++ch)
-	if (w & ((bitset_word_t) 1 << j))
-	  re_set_fastmap (fastmap, icase, ch);
-    }
-}
-
-#ifdef RE_ENABLE_I18N
-static void
-handle_complex_bracket(regex_t *bufp, re_dfa_t *dfa, char *fastmap, Idx node, bool icase)
-{
-  re_charset_t *cset = dfa->nodes[node].opr.mbcset;
-  Idx i;
-
-# ifdef _LIBC
-  handle_collation_elements(fastmap, cset, icase);
-# endif
-
-  if (should_handle_multibyte_chars(dfa, cset))
-    {
-      handle_multibyte_char_starts(fastmap);
-    }
-  else
-    {
-      handle_specific_mbchars(bufp, dfa, fastmap, cset, icase);
-    }
-}
-
-# ifdef _LIBC
-static void
-handle_collation_elements(char *fastmap, re_charset_t *cset, bool icase)
-{
-  if (_NL_CURRENT_WORD (LC_COLLATE, _NL_COLLATE_NRULES) != 0
-      && (cset->ncoll_syms || cset->nranges))
-    {
-      const int32_t *table = (const int32_t *)
-	_NL_CURRENT (LC_COLLATE, _NL_COLLATE_TABLEMB);
-      for (int i = 0; i < SBC_MAX; ++i)
-	if (table[i] < 0)
-	  re_set_fastmap (fastmap, icase, i);
-    }
-}
-# endif
-
-static bool
-should_handle_multibyte_chars(re_dfa_t *dfa, re_charset_t *cset)
-{
-  return (dfa->mb_cur_max > 1
-	  && (cset->nchar_classes || cset->non_match || cset->nranges
-# ifdef _LIBC
-	      || cset->nequiv_classes
-# endif
-	     ));
-}
-
-static void
-handle_multibyte_char_starts(char *fastmap)
-{
-  unsigned char c = 0;
-  do
-    {
-      mbstate_t mbs;
-      memset (&mbs, 0, sizeof (mbs));
-      if (__mbrtowc (NULL, (char *) &c, 1, &mbs) == (size_t) -2)
-	re_set_fastmap (fastmap, false, (int) c);
-    }
-  while (++c != 0);
-}
-
-static void
-handle_specific_mbchars(regex_t *bufp, re_dfa_t *dfa, char *fastmap, 
-			re_charset_t *cset, bool icase)
-{
-  for (Idx i = 0; i < cset->nmbchars; ++i)
-    {
-      char buf[256];
-      mbstate_t state;
-      memset (&state, 0, sizeof (state));
-      
-      if (__wcrtomb (buf, cset->mbchars[i], &state) != (size_t) -1)
-	re_set_fastmap (fastmap, icase, *(unsigned char *) buf);
-      
-      if ((bufp->syntax & RE_ICASE) && dfa->mb_cur_max > 1)
-	{
-	  if (__wcrtomb (buf, __towlower (cset->mbchars[i]), &state) != (size_t) -1)
-	    re_set_fastmap (fastmap, false, *(unsigned char *) buf);
-	}
-    }
-}
-#endif
 
 /* Entry point for POSIX code.  */
 /* regcomp takes a regular expression as a string and compiles it.
@@ -517,47 +466,52 @@ regcomp (regex_t *__restrict preg, const char *__restrict pattern, int cflags)
 {
   reg_errcode_t ret;
   reg_syntax_t syntax;
-  size_t pattern_len;
 
-  if (!preg || !pattern)
+  if (preg == NULL || pattern == NULL)
     return REG_BADPAT;
-
-  syntax = (cflags & REG_EXTENDED) ? RE_SYNTAX_POSIX_EXTENDED : RE_SYNTAX_POSIX_BASIC;
 
   preg->buffer = NULL;
   preg->allocated = 0;
   preg->used = 0;
+  preg->fastmap = NULL;
+  preg->translate = NULL;
 
   preg->fastmap = re_malloc (char, SBC_MAX);
-  if (!preg->fastmap)
+  if (__glibc_unlikely (preg->fastmap == NULL))
     return REG_ESPACE;
 
+  syntax = (cflags & REG_EXTENDED) ? RE_SYNTAX_POSIX_EXTENDED : RE_SYNTAX_POSIX_BASIC;
+  
   if (cflags & REG_ICASE)
     syntax |= RE_ICASE;
 
-  if (cflags & REG_NEWLINE) {
-    syntax &= ~RE_DOT_NEWLINE;
-    syntax |= RE_HAT_LISTS_NOT_NEWLINE;
-    preg->newline_anchor = 1;
-  } else {
-    preg->newline_anchor = 0;
-  }
-
+  if (cflags & REG_NEWLINE)
+    {
+      syntax &= ~RE_DOT_NEWLINE;
+      syntax |= RE_HAT_LISTS_NOT_NEWLINE;
+      preg->newline_anchor = 1;
+    }
+  else
+    {
+      preg->newline_anchor = 0;
+    }
+  
   preg->no_sub = (cflags & REG_NOSUB) != 0;
-  preg->translate = NULL;
 
-  pattern_len = strlen (pattern);
-  ret = re_compile_internal (preg, pattern, pattern_len, syntax);
+  ret = re_compile_internal (preg, pattern, strlen (pattern), syntax);
 
   if (ret == REG_ERPAREN)
     ret = REG_EPAREN;
 
-  if (ret == REG_NOERROR) {
-    re_compile_fastmap (preg);
-  } else {
-    re_free (preg->fastmap);
-    preg->fastmap = NULL;
-  }
+  if (__glibc_likely (ret == REG_NOERROR))
+    {
+      (void) re_compile_fastmap (preg);
+    }
+  else
+    {
+      re_free (preg->fastmap);
+      preg->fastmap = NULL;
+    }
 
   return (int) ret;
 }
